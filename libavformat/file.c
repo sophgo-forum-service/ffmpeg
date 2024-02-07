@@ -95,8 +95,9 @@ typedef struct FileContext {
     int64_t virtual_pos_base;
     int is_mov_mp4;
     int is2slice;
-	int isfalloc;
-	int falloc_blk;
+    int isfalloc;
+    int falloc_blk;
+    int isfsync;
 } FileContext;
 
 static const AVOption file_options[] = {
@@ -106,6 +107,7 @@ static const AVOption file_options[] = {
     { "seekable", "Sets if the file is seekable", offsetof(FileContext, seekable), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 0, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
     { "toslice", "Slice files when writing", offsetof(FileContext, is2slice), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { "falloc", "Enable Fallocate", offsetof(FileContext, isfalloc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
+    { "fsync", "Enable Fsync", offsetof(FileContext, isfsync), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL }
 };
 
@@ -496,6 +498,11 @@ static int file_close(URLContext *h)
 		ftruncate(c->fd, FILE_PREALLOC_SIZE*c->falloc_blk);
 		c->falloc_blk = 0;
 	}
+
+    if (c->isfsync) {
+        printf("Do fsync %s\n",h->filename);
+        fsync(c->fd);
+    }
     return close(c->fd);
 }
 
