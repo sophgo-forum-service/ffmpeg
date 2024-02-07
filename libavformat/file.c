@@ -40,6 +40,8 @@
 #include <sys/sendfile.h>
 #include "os_support.h"
 #include "url.h"
+#define _GNU_SOURCE 			/* See feature_test_macros(7) */
+#include <fcntl.h>
 
 /* Some systems may not have S_ISFIFO */
 #ifndef S_ISFIFO
@@ -72,6 +74,7 @@
 
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define FILE_SLICE_SIZE (1 * 1024 * 1024)
+#define FILE_PREALLOC_SIZE (20 * 1024 * 1024)
 
 typedef struct FileContext {
     const AVClass *class;
@@ -91,6 +94,8 @@ typedef struct FileContext {
     int64_t virtual_pos_base;
     int is_mov_mp4;
     int is2slice;
+	int isfalloc;
+	int falloc_blk;
 } FileContext;
 
 static const AVOption file_options[] = {
@@ -99,6 +104,7 @@ static const AVOption file_options[] = {
     { "follow", "Follow a file as it is being written", offsetof(FileContext, follow), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     { "seekable", "Sets if the file is seekable", offsetof(FileContext, seekable), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 0, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
     { "toslice", "Slice files when writing", offsetof(FileContext, is2slice), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
+    { "falloc", "Enable Fallocate", offsetof(FileContext, isfalloc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL }
 };
 
@@ -183,7 +189,15 @@ static int file_write(URLContext *h, const unsigned char *buf, int size)
     int ret;
     // av_log(h, AV_LOG_WARNING, "Enter file_write(%ld:%d + %d) \n", c->pos, c->total_size, size);
     size = FFMIN(size, c->blocksize);
-    if (!c->is2slice)
+	if (c->isfalloc) {
+		int fd = (c->is2slice) ? c->final_fd : c->fd;
+		if (c->pos + size >= c->falloc_blk * FILE_PREALLOC_SIZE) {
+			printf("PreAlloc %d\n", FILE_PREALLOC_SIZE);
+			posix_fallocate(fd, c->falloc_blk * FILE_PREALLOC_SIZE, FILE_PREALLOC_SIZE);
+			c->falloc_blk++;
+		}
+	}
+	if (!c->is2slice)
     {}
     else if (c->pos > c->total_size)
     {
@@ -352,7 +366,6 @@ static int file_open(URLContext *h, const char *filename, int flags)
     if (fd == -1)
         return AVERROR(errno);
     c->fd = fd;
-
     h->is_streamed = !fstat(fd, &st) && S_ISFIFO(st.st_mode);
 
     read_fullfilepath(fd);
@@ -363,7 +376,9 @@ static int file_open(URLContext *h, const char *filename, int flags)
             return AVERROR(errno);
         c->fd = fd;
     }
-
+	if (c->isfalloc) {
+		c->falloc_blk = 0;
+	}
     /* Buffer writes more than the default 32k to improve throughput especially
      * with networked file systems */
     if (!h->is_streamed && flags & AVIO_FLAG_WRITE)
@@ -468,6 +483,11 @@ static int file_close(URLContext *h)
     {
         sanitize_mp4end(c->fd);
     }
+	if (c->isfalloc) {
+		printf("Origin: %d Truncate %d\n", c->falloc_blk * FILE_PREALLOC_SIZE, c->total_size);
+		//ftruncate(c->fd, c->total_size);
+		c->falloc_blk = 0;
+	}
     return close(c->fd);
 }
 
