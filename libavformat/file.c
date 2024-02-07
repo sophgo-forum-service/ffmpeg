@@ -199,7 +199,9 @@ static int file_write(URLContext *h, const unsigned char *buf, int size)
 	if (c->isfalloc) {
 		int fd = (c->is2slice) ? c->final_fd : c->fd;
 		if (c->pos + size >= c->falloc_blk * FILE_PREALLOC_SIZE) {
+			pthread_mutex_lock(&file_mutex);
 			fallocate(fd, FALLOC_FL_KEEP_SIZE, c->falloc_blk * FILE_PREALLOC_SIZE, FILE_PREALLOC_SIZE);
+			pthread_mutex_unlock(&file_mutex);
 			c->falloc_blk++;
 		}
 	}
