@@ -40,8 +40,9 @@
 #include <sys/sendfile.h>
 #include "os_support.h"
 #include "url.h"
-#define _GNU_SOURCE 			/* See feature_test_macros(7) */
-#include <fcntl.h>
+#define _GNU_SOURCE                    /* See feature_test_macros(7) */
+#define FALLOC_FL_KEEP_SIZE 0x1
+extern int fallocate (int __fd, int __mode, __off_t __offset, __off_t __len);
 
 /* Some systems may not have S_ISFIFO */
 #ifndef S_ISFIFO
@@ -189,14 +190,20 @@ static int file_write(URLContext *h, const unsigned char *buf, int size)
     int ret;
     // av_log(h, AV_LOG_WARNING, "Enter file_write(%ld:%d + %d) \n", c->pos, c->total_size, size);
     size = FFMIN(size, c->blocksize);
+
+	if(access(h->filename, F_OK) != 0) {
+		av_log(h, AV_LOG_WARNING, "File %s not exist\n", h->filename);
+		return -1;
+	}
+
 	if (c->isfalloc) {
 		int fd = (c->is2slice) ? c->final_fd : c->fd;
 		if (c->pos + size >= c->falloc_blk * FILE_PREALLOC_SIZE) {
-			printf("PreAlloc %d\n", FILE_PREALLOC_SIZE);
-			posix_fallocate(fd, c->falloc_blk * FILE_PREALLOC_SIZE, FILE_PREALLOC_SIZE);
+			fallocate(fd, FALLOC_FL_KEEP_SIZE, c->falloc_blk * FILE_PREALLOC_SIZE, FILE_PREALLOC_SIZE);
 			c->falloc_blk++;
 		}
 	}
+
 	if (!c->is2slice)
     {}
     else if (c->pos > c->total_size)
@@ -484,8 +491,7 @@ static int file_close(URLContext *h)
         sanitize_mp4end(c->fd);
     }
 	if (c->isfalloc) {
-		printf("Origin: %d Truncate %d\n", c->falloc_blk * FILE_PREALLOC_SIZE, c->total_size);
-		//ftruncate(c->fd, c->total_size);
+		ftruncate(c->fd, FILE_PREALLOC_SIZE*c->falloc_blk);
 		c->falloc_blk = 0;
 	}
     return close(c->fd);
