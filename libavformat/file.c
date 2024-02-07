@@ -98,6 +98,7 @@ typedef struct FileContext {
     int isfalloc;
     int falloc_blk;
     int isfsync;
+    int preallocsize;
 } FileContext;
 
 static const AVOption file_options[] = {
@@ -108,6 +109,7 @@ static const AVOption file_options[] = {
     { "toslice", "Slice files when writing", offsetof(FileContext, is2slice), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { "falloc", "Enable Fallocate", offsetof(FileContext, isfalloc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { "fsync", "Enable Fsync", offsetof(FileContext, isfsync), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
+    { "preallocsize", "set prealloc block size", offsetof(FileContext, preallocsize), AV_OPT_TYPE_INT, { .i64 = 100 }, 1, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL }
 };
 
@@ -200,9 +202,9 @@ static int file_write(URLContext *h, const unsigned char *buf, int size)
 
 	if (c->isfalloc) {
 		int fd = (c->is2slice) ? c->final_fd : c->fd;
-		if (c->pos + size >= c->falloc_blk * FILE_PREALLOC_SIZE) {
+		if (c->pos + size >= c->falloc_blk * c->preallocsize * 1024 * 1024) {
 			pthread_mutex_lock(&file_mutex);
-			fallocate(fd, FALLOC_FL_KEEP_SIZE, c->falloc_blk * FILE_PREALLOC_SIZE, FILE_PREALLOC_SIZE);
+			fallocate(fd, FALLOC_FL_KEEP_SIZE, c->falloc_blk * c->preallocsize * 1024 * 1024, c->preallocsize * 1024 * 1024);
 			pthread_mutex_unlock(&file_mutex);
 			c->falloc_blk++;
 		}
@@ -388,7 +390,7 @@ static int file_open(URLContext *h, const char *filename, int flags)
         c->fd = fd;
     }
 	if (c->isfalloc) {
-		c->falloc_blk = 0;
+		c->falloc_blk = st.st_size/(c->preallocsize * 1024 * 1024);
 	}
     /* Buffer writes more than the default 32k to improve throughput especially
      * with networked file systems */
@@ -495,7 +497,7 @@ static int file_close(URLContext *h)
         sanitize_mp4end(c->fd);
     }
 	if (c->isfalloc) {
-		ftruncate(c->fd, FILE_PREALLOC_SIZE*c->falloc_blk);
+		ftruncate(c->fd, c->preallocsize * 1024 * 1024 *c->falloc_blk);
 		c->falloc_blk = 0;
 	}
 
