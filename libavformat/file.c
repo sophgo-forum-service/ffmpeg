@@ -35,6 +35,9 @@
 #endif
 #include <sys/stat.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <sys/sendfile.h>
 #include "os_support.h"
 #include "url.h"
 
@@ -67,6 +70,9 @@
 
 /* standard file protocol */
 
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define FILE_SLICE_SIZE (1 * 1024 * 1024)
+
 typedef struct FileContext {
     const AVClass *class;
     int fd;
@@ -77,6 +83,14 @@ typedef struct FileContext {
 #if HAVE_DIRENT_H
     DIR *dir;
 #endif
+    int final_fd;
+    int64_t pos;
+    int total_size;
+    int64_t virtual_pos;
+    int virtual_size;
+    int64_t virtual_pos_base;
+    int is_mov_mp4;
+    int is2slice;
 } FileContext;
 
 static const AVOption file_options[] = {
@@ -84,6 +98,7 @@ static const AVOption file_options[] = {
     { "blocksize", "set I/O operation maximum block size", offsetof(FileContext, blocksize), AV_OPT_TYPE_INT, { .i64 = INT_MAX }, 1, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { "follow", "Follow a file as it is being written", offsetof(FileContext, follow), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
     { "seekable", "Sets if the file is seekable", offsetof(FileContext, seekable), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 0, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
+    { "toslice", "Slice files when writing", offsetof(FileContext, is2slice), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL }
 };
 
@@ -111,6 +126,7 @@ static int file_read(URLContext *h, unsigned char *buf, int size)
     FileContext *c = h->priv_data;
     int ret;
     size = FFMIN(size, c->blocksize);
+    // av_log(h, AV_LOG_WARNING, "Enter file_read(%d) \n", size);
     ret = read(c->fd, buf, size);
     if (ret == 0 && c->follow)
         return AVERROR(EAGAIN);
@@ -119,12 +135,113 @@ static int file_read(URLContext *h, unsigned char *buf, int size)
     return (ret == -1) ? AVERROR(errno) : ret;
 }
 
+static int is_mp4_mov_suffix(const char* str_source)
+{
+    int len = strlen(str_source);
+    int compare_len = 4;
+    if (len > compare_len)
+    {
+        const char* pc = str_source + len - compare_len;
+        if (*pc == 'm')
+        {
+            if (strncmp(pc+1, "ov", 2) == 0 || strncmp(pc+1, "p4", 2) == 0)
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void read_fullfilepath(int fd)
+{
+    char buf[256];
+    char filepath[1024]="";
+    int filepath_size = 1024, bufsize = 256;
+
+    snprintf(buf, bufsize, "/proc/self/fd/%d", fd);
+    if (readlink(buf, filepath, filepath_size) > 0)
+        av_log(NULL, AV_LOG_WARNING, "Enter file_open(%s) \n", filepath);
+}
+
+static int create_tmpfile(const char* strTemplate)
+{
+    int fd;
+    char filepath[128]="";
+    strcpy(filepath, strTemplate);
+    fd = mkstemp(filepath);
+    // fd = open(filepath, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd == -1)
+        return -1;
+    remove(filepath);
+    return fd;
+}
+
 static int file_write(URLContext *h, const unsigned char *buf, int size)
 {
     FileContext *c = h->priv_data;
     int ret;
+    // av_log(h, AV_LOG_WARNING, "Enter file_write(%ld:%d + %d) \n", c->pos, c->total_size, size);
     size = FFMIN(size, c->blocksize);
+    if (!c->is2slice)
+    {}
+    else if (c->pos > c->total_size)
+    {
+        av_log(h, AV_LOG_WARNING, "file_write out-of-range \n");
+        return size;
+    }
+    else if (c->virtual_pos < c->virtual_pos_base)
+    {
+        off_t cur_off =  lseek(c->final_fd, 0, SEEK_CUR);
+        // av_log(h, AV_LOG_WARNING, "file_write rollback \n");
+        lseek(c->final_fd, c->virtual_pos, SEEK_SET);
+        ret = write(c->final_fd, buf, size);
+        lseek(c->final_fd, cur_off, SEEK_SET);
+        return (ret == -1) ? AVERROR(errno) : ret;
+    }
+    else if (c->pos + size < c->total_size)
+    {
+        // av_log(h, AV_LOG_WARNING, "file_write rollback case.2 \n");
+    }
+    else if (c->pos + size >= FILE_SLICE_SIZE)
+    {
+        int remain = c->pos + size - FILE_SLICE_SIZE;
+        off_t offset = 0;
+        ssize_t send_size = 0;
+        ret = write(c->fd, buf, size - remain);
+        pthread_mutex_lock(&file_mutex);
+        send_size = sendfile(c->final_fd, c->fd, &offset, FILE_SLICE_SIZE);
+        pthread_mutex_unlock(&file_mutex);
+        if (send_size != FILE_SLICE_SIZE)
+            av_log(h, AV_LOG_WARNING, "sendfile un-finished %ld ?\n", send_size);
+
+        c->virtual_pos_base += FILE_SLICE_SIZE;
+        ftruncate(c->fd, 0);
+        lseek(c->fd, 0, SEEK_SET);
+        c->pos = c->total_size = 0;
+        if (remain > 0) {
+            int ret2 = write(c->fd, buf + size - remain, remain);
+            c->pos = c->total_size = ret2;
+            // av_log(h, AV_LOG_WARNING, "file_write warp file %d %d\n", remain, ret2);
+            ret += ret2;
+        }
+        if (ret > 0 && c->virtual_size < c->virtual_pos + ret) {
+            c->virtual_pos += ret;
+            c->virtual_size = c->virtual_pos;
+        }
+        return (ret == -1) ? AVERROR(errno) : ret;
+    }
     ret = write(c->fd, buf, size);
+    if (ret > 0) {
+        c->pos += ret;
+        if (c->total_size < c->pos)
+            c->total_size = c->pos;
+    }
+    if (ret > 0) {
+        c->virtual_pos += ret;
+        if (c->virtual_size < c->virtual_pos)
+            c->virtual_size = c->virtual_pos;
+    }
     return (ret == -1) ? AVERROR(errno) : ret;
 }
 
@@ -196,6 +313,7 @@ static int file_move(URLContext *h_src, URLContext *h_dst)
     const char *filename_dst = h_dst->filename;
     av_strstart(filename_src, "file:", &filename_src);
     av_strstart(filename_dst, "file:", &filename_dst);
+    // av_log(NULL, AV_LOG_WARNING, "Enter file_move(%s %s) \n", filename_src, filename_dst);
 
     if (rename(filename_src, filename_dst) < 0)
         return AVERROR(errno);
@@ -213,6 +331,8 @@ static int file_open(URLContext *h, const char *filename, int flags)
     struct stat st;
 
     av_strstart(filename, "file:", &filename);
+
+    c->is_mov_mp4 = is_mp4_mov_suffix(filename);
 
     if (flags & AVIO_FLAG_WRITE && flags & AVIO_FLAG_READ) {
         access = O_CREAT | O_RDWR;
@@ -235,6 +355,15 @@ static int file_open(URLContext *h, const char *filename, int flags)
 
     h->is_streamed = !fstat(fd, &st) && S_ISFIFO(st.st_mode);
 
+    read_fullfilepath(fd);
+    if (c->is2slice) {
+        c->final_fd = fd;
+        fd = create_tmpfile("/tmp/sdcardXXXXXX");
+        if (fd == -1)
+            return AVERROR(errno);
+        c->fd = fd;
+    }
+
     /* Buffer writes more than the default 32k to improve throughput especially
      * with networked file systems */
     if (!h->is_streamed && flags & AVIO_FLAG_WRITE)
@@ -251,21 +380,94 @@ static int64_t file_seek(URLContext *h, int64_t pos, int whence)
 {
     FileContext *c = h->priv_data;
     int64_t ret;
+    // av_log(h, AV_LOG_WARNING, "Enter file_seek(%ld %d) \n", pos, whence);
 
     if (whence == AVSEEK_SIZE) {
         struct stat st;
         ret = fstat(c->fd, &st);
         return ret < 0 ? AVERROR(errno) : (S_ISFIFO(st.st_mode) ? 0 : st.st_size);
     }
-
+    if (SEEK_SET == whence) {
+        c->virtual_pos = pos;
+    } else if (SEEK_CUR == whence) {
+        c->virtual_pos += pos;
+    }
+    if (c->is2slice) {
+        if (c->virtual_pos > c->virtual_pos_base && c->virtual_pos_base > 0) {
+            // av_log(h, AV_LOG_WARNING, "file_seek out-of-range (%ld %ld %ld %d)\n", c->virtual_pos, c->virtual_pos_base, pos, c->total_size);
+            pos = c->virtual_pos - c->virtual_pos_base;
+            whence = SEEK_SET;
+        }
+        else if (c->virtual_pos < c->virtual_pos_base)
+        {
+            // av_log(h, AV_LOG_WARNING, "file_seek back2past (%ld %ld %ld %d)\n", c->virtual_pos, c->virtual_pos_base, pos, c->total_size);
+            return c->virtual_pos;
+        }
+    }
     ret = lseek(c->fd, pos, whence);
+    if (ret >= 0){
+        if (SEEK_SET == whence) {
+            c->pos = pos;
+        } else if (SEEK_CUR == whence) {
+            c->pos += pos;
+        }
+    }
 
     return ret < 0 ? AVERROR(errno) : ret;
+}
+
+static void sanitize_mp4end(int target_fd)
+{
+    struct stat st;
+    if (fstat(target_fd, &st) == 0)
+    {
+        off_t end_off =  lseek(target_fd, 0, SEEK_CUR);
+        // file size larger than file end, sanitize it at most 8 bytes quickly
+        if (st.st_size > end_off)
+        {
+            char buf[8] = "";
+            int len = (st.st_size - end_off);
+            len = (len > 8) ? 8 : len;
+            write(target_fd, buf, len);
+        }
+    }
 }
 
 static int file_close(URLContext *h)
 {
     FileContext *c = h->priv_data;
+    if (c->is2slice) {
+        int size, free_size;
+        // ssize_t send_size = 0;
+        char buf[8] = "abcdfree";
+        size = lseek(c->fd, 0, SEEK_END);
+        free_size = (size % FILE_SLICE_SIZE) ;
+        if (free_size) {
+            free_size = FILE_SLICE_SIZE - free_size;
+            if (c->is_mov_mp4) {
+                int free_nssize = htonl(free_size);
+                memcpy(buf, &free_nssize, 4);
+                write(c->fd, buf, 8);
+            }
+            ftruncate(c->fd, size + free_size);
+        }
+        lseek(c->fd, 0, SEEK_SET);
+        pthread_mutex_lock(&file_mutex);
+        if (size + free_size) {
+            //send_size =
+            sendfile(c->final_fd, c->fd, NULL, size + free_size);
+        }
+        pthread_mutex_unlock(&file_mutex);
+        // av_log(h, AV_LOG_WARNING, "Enter file_close %lu (%d+%d)\n", send_size, size, free_size);
+        if (c->is_mov_mp4) {
+            sanitize_mp4end(c->final_fd);
+        }
+        close(c->final_fd);
+    }
+    else if (c->is_mov_mp4)
+    {
+        sanitize_mp4end(c->fd);
+    }
     return close(c->fd);
 }
 
