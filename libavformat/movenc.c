@@ -5763,6 +5763,7 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
     trk->entry++;
     trk->sample_count += samples_in_chunk;
     mov->mdat_size    += size;
+    update_size(pb, 28);
 
     if (trk->hint_track >= 0 && trk->hint_track < mov->nb_streams)
         ff_mov_add_hinted_packet(s, pkt, trk->hint_track, trk->entry,
